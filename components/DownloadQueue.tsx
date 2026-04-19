@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useState, useRef } from "react";
 import {
   Box,
   Button,
@@ -30,6 +30,7 @@ import {
   FiFile,
   FiPackage,
   FiRefreshCw,
+  FiLoader,
 } from "react-icons/fi";
 import { DownloadItem, MediaType } from "@/types";
 
@@ -73,43 +74,6 @@ function formatSize(bytes?: number): string {
   return `${(bytes / (1024 * 1024)).toFixed(1)}MB`;
 }
 
-// ── AdjectiveAdjectiveAnimal ZIP name generator ────────────────────────────
-const ADJECTIVES = [
-  "Amber","Arctic","Blazing","Bold","Brave","Bright","Calm","Clever","Cosmic",
-  "Crimson","Crystal","Daring","Dark","Dawn","Deep","Divine","Dusty","Electric",
-  "Emerald","Epic","Fierce","Fiery","Frosty","Fuzzy","Giant","Gilded","Glowing",
-  "Golden","Grand","Gritty","Hidden","Hollow","Icy","Indigo","Iron","Jade",
-  "Jolly","Keen","Lazy","Lofty","Lone","Lucky","Lunar","Majestic","Marble",
-  "Mighty","Misty","Neon","Noble","Obsidian","Odd","Onyx","Pale","Phantom",
-  "Primal","Proud","Quiet","Radiant","Rapid","Rogue","Royal","Ruby","Rustic",
-  "Sacred","Savage","Scarlet","Shadow","Sharp","Silent","Silver","Sleek","Sly",
-  "Solar","Sonic","Spectral","Stealthy","Steel","Stormy","Strange","Swift",
-  "Teal","Thunder","Tiny","Toxic","Turbo","Twilight","Ultra","Velvet","Vibrant",
-  "Violet","Vivid","Wild","Windy","Wired","Wise","Witty","Zany","Zealous","Zen",
-];
-
-const ANIMALS = [
-  "Albatross","Axolotl","Badger","Basilisk","Bear","Bison","Bobcat","Buffalo",
-  "Capybara","Caracal","Cheetah","Chimera","Cobra","Condor","Cougar","Coyote",
-  "Crane","Crow","Dingo","Dolphin","Dragon","Eagle","Falcon","Ferret","Fox",
-  "Gecko","Gorilla","Griffin","Grizzly","Hawk","Hedgehog","Hippo","Hyena",
-  "Ibis","Iguana","Jaguar","Kestrel","Komodo","Kraken","Lemur","Leopard",
-  "Lynx","Mamba","Manta","Marmot","Mongoose","Moose","Narwhal","Ocelot",
-  "Osprey","Otter","Panther","Parrot","Pelican","Phoenix","Puma","Python",
-  "Raven","Rhino","Salamander","Scorpion","Serval","Shark","Sloth","Sphinx",
-  "Stallion","Stingray","Stoat","Tiger","Titan","Toucan","Viper","Vulture",
-  "Walrus","Weasel","Wolf","Wolverine","Wombat","Wyvern","Yak","Zebra",
-];
-
-function generateZipName(): string {
-  const pick = <T>(arr: T[]): T => arr[Math.floor(Math.random() * arr.length)];
-  const adj1 = pick(ADJECTIVES);
-  let adj2 = pick(ADJECTIVES);
-  while (adj2 === adj1) adj2 = pick(ADJECTIVES);
-  const animal = pick(ANIMALS);
-  return `${adj1}${adj2}${animal}.zip`;
-}
-
 // Trigger a browser file download from a Blob
 function triggerDownload(blob: Blob, filename: string) {
   const objectUrl = URL.createObjectURL(blob);
@@ -119,11 +83,25 @@ function triggerDownload(blob: Blob, filename: string) {
   a.download = filename;
   document.body.appendChild(a);
   a.click();
-  // Small delay before cleanup so the browser has time to start the download
   setTimeout(() => {
     document.body.removeChild(a);
     URL.revokeObjectURL(objectUrl);
   }, 300);
+}
+
+// Convert base64 string to Blob
+function base64ToBlob(base64: string, contentType: string): Blob {
+  const byteChars = atob(base64);
+  const byteArrays: Uint8Array[] = [];
+  for (let offset = 0; offset < byteChars.length; offset += 512) {
+    const slice = byteChars.slice(offset, offset + 512);
+    const byteNumbers = new Array(slice.length);
+    for (let i = 0; i < slice.length; i++) {
+      byteNumbers[i] = slice.charCodeAt(i);
+    }
+    byteArrays.push(new Uint8Array(byteNumbers));
+  }
+  return new Blob(byteArrays, { type: contentType });
 }
 
 // Extract filename from Content-Disposition header or fall back to a default
@@ -137,6 +115,28 @@ function filenameFromResponse(res: Response, fallback: string): string {
   return fallback;
 }
 
+// ── SSE event types from the server ────────────────────────────────────────
+interface SSEEvent {
+  type:
+    | "start"
+    | "file_start"
+    | "file_done"
+    | "file_error"
+    | "zipping"
+    | "complete"
+    | "error";
+  total?: number;
+  current?: number;
+  index?: number;
+  filename?: string;
+  progress?: number;
+  error?: string;
+  message?: string;
+  contentType?: string;
+  data?: string; // base64 file data
+  isZip?: boolean;
+}
+
 export default function DownloadQueue({
   items,
   onRemove,
@@ -146,7 +146,11 @@ export default function DownloadQueue({
 }: DownloadQueueProps) {
   const [downloading, setDownloading] = useState(false);
   const [saveAsZip, setSaveAsZip] = useState(false);
-  const [downloadSpeed, setDownloadSpeed] = useState<string>("");
+  const [overallProgress, setOverallProgress] = useState(0);
+  const [statusMessage, setStatusMessage] = useState("");
+  const [currentFileIndex, setCurrentFileIndex] = useState<number | null>(null);
+  const [isZipping, setIsZipping] = useState(false);
+  const abortRef = useRef<(() => void) | null>(null);
   const toast = useToast();
 
   const pendingItems = items.filter((i) => i.status === "pending");
@@ -154,108 +158,167 @@ export default function DownloadQueue({
   const errorItems = items.filter((i) => i.status === "error");
   const activeItems = items.filter((i) => i.status === "downloading");
 
-  // ── Download all pending items with progress tracking ──────────────────
+  // ── SSE-based download with per-file progress ──────────────────────────
   const handleDownloadAll = async () => {
     if (pendingItems.length === 0 || downloading) return;
     setDownloading(true);
+    setOverallProgress(0);
+    setStatusMessage("Starting download…");
+    setCurrentFileIndex(null);
+    setIsZipping(false);
 
-    // Optimistically mark as downloading
+    // Mark all as downloading
     pendingItems.forEach((item) =>
       onUpdate(item.url, { status: "downloading", progress: 0 })
     );
 
+    const useZip = saveAsZip || pendingItems.length > 1;
+
     try {
-      const useZip = saveAsZip || pendingItems.length > 1;
+      const itemsParam = encodeURIComponent(JSON.stringify(pendingItems));
+      const url = `/api/download?items=${itemsParam}&forceZip=${useZip}`;
 
-      // Start the download request
-      const startTime = Date.now();
-      const res = await fetch("/api/download", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          items: pendingItems,
-          forceZip: useZip,
-        }),
-      });
+      const res = await fetch(url, { method: "GET" });
 
-      if (!res.ok) {
-        const errBody = await res.json().catch(() => ({ error: `HTTP ${res.status}` }));
-        throw new Error(errBody.error || `HTTP ${res.status}`);
+      if (!res.ok || !res.body) {
+        throw new Error(`Server error: HTTP ${res.status}`);
       }
 
-      // Stream the response with progress tracking
-      const contentLength = res.headers.get("content-length");
-      const total = contentLength ? parseInt(contentLength, 10) : 0;
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
 
-      const reader = res.body?.getReader();
-      const chunks: Uint8Array[] = [];
-      let receivedLength = 0;
-      let lastUpdate = Date.now();
-      let lastReceived = 0;
+      // Allow cancellation
+      abortRef.current = () => reader.cancel();
 
-      if (reader) {
-        while (true) {
-          const { done, value } = await reader.read();
-          if (done) break;
+      const startTime = Date.now();
 
-          chunks.push(value);
-          receivedLength += value.length;
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
 
-          // Update progress and speed
-          const now = Date.now();
-          const elapsed = (now - lastUpdate) / 1000;
-          if (elapsed >= 0.5) {
-            // Update every 500ms
-            const bytesPerSec = (receivedLength - lastReceived) / elapsed;
-            const mbps = (bytesPerSec / (1024 * 1024)).toFixed(2);
-            setDownloadSpeed(`${mbps} MB/s`);
-            lastUpdate = now;
-            lastReceived = receivedLength;
+        buffer += decoder.decode(value, { stream: true });
 
-            if (total > 0) {
-              const progress = Math.min(Math.round((receivedLength / total) * 100), 99);
-              pendingItems.forEach((item) =>
-                onUpdate(item.url, { status: "downloading", progress })
+        // Parse SSE lines
+        const lines = buffer.split("\n");
+        buffer = lines.pop() ?? ""; // keep incomplete line
+
+        for (const line of lines) {
+          if (!line.startsWith("data: ")) continue;
+          const raw = line.slice(6).trim();
+          if (!raw) continue;
+
+          let event: SSEEvent;
+          try {
+            event = JSON.parse(raw);
+          } catch {
+            continue;
+          }
+
+          switch (event.type) {
+            case "start":
+              setStatusMessage(
+                `Downloading ${event.total} file${event.total !== 1 ? "s" : ""}…`
               );
+              break;
+
+            case "file_start":
+              setCurrentFileIndex(event.index ?? null);
+              setStatusMessage(
+                `Downloading ${event.current ?? (event.index ?? 0) + 1} of ${event.total}…`
+              );
+              // Mark this specific item as downloading
+              if (event.index !== undefined && pendingItems[event.index]) {
+                onUpdate(pendingItems[event.index].url, {
+                  status: "downloading",
+                  progress: 0,
+                });
+              }
+              break;
+
+            case "file_done":
+              if (event.index !== undefined && pendingItems[event.index]) {
+                onUpdate(pendingItems[event.index].url, {
+                  status: useZip ? "downloading" : "done",
+                  progress: useZip ? event.progress ?? 50 : 100,
+                });
+              }
+              if (event.progress !== undefined) {
+                setOverallProgress(event.progress);
+              }
+              setStatusMessage(
+                `Downloaded ${event.current ?? (event.index ?? 0) + 1} of ${event.total} — ${event.filename}`
+              );
+              break;
+
+            case "file_error":
+              if (event.index !== undefined && pendingItems[event.index]) {
+                onUpdate(pendingItems[event.index].url, {
+                  status: "error",
+                  error: event.error ?? "Download failed",
+                  progress: undefined,
+                });
+              }
+              if (event.progress !== undefined) {
+                setOverallProgress(event.progress);
+              }
+              break;
+
+            case "zipping":
+              setIsZipping(true);
+              setStatusMessage("Building ZIP archive…");
+              setOverallProgress(99);
+              // Mark all still-downloading items as near-done
+              pendingItems.forEach((item) => {
+                if (item.status === "downloading") {
+                  onUpdate(item.url, { status: "downloading", progress: 99 });
+                }
+              });
+              break;
+
+            case "complete": {
+              if (!event.data || !event.contentType || !event.filename) break;
+
+              const blob = base64ToBlob(event.data, event.contentType);
+              triggerDownload(blob, event.filename);
+
+              // Mark all as done
+              pendingItems.forEach((item) =>
+                onUpdate(item.url, { status: "done", progress: 100 })
+              );
+
+              setOverallProgress(100);
+              setIsZipping(false);
+
+              if (onDownloadComplete) {
+                onDownloadComplete(pendingItems);
+              }
+
+              const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
+              toast({
+                title: `${pendingItems.length} file${pendingItems.length !== 1 ? "s" : ""} downloaded in ${elapsed}s`,
+                description: event.filename,
+                status: "success",
+                duration: 4000,
+                isClosable: true,
+                position: "top-right",
+              });
+              break;
             }
+
+            case "error":
+              throw new Error(event.message ?? "Download failed");
           }
         }
       }
-
-      // Combine chunks into blob
-      const blob = new Blob(chunks as BlobPart[]);
-      const defaultName =
-        useZip
-          ? generateZipName()
-          : (pendingItems[0].filename || "harveey_media");
-      const filename = filenameFromResponse(res, defaultName);
-
-      triggerDownload(blob, filename);
-
-      // Mark done
-      pendingItems.forEach((item) =>
-        onUpdate(item.url, { status: "done", progress: 100 })
-      );
-
-      // Notify parent that items are downloaded (so we can mark them as processed in extension queue)
-      if (onDownloadComplete) {
-        onDownloadComplete(pendingItems);
-      }
-
-      const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
-      toast({
-        title: `${pendingItems.length} file${pendingItems.length !== 1 ? "s" : ""} downloaded in ${elapsed}s`,
-        description: filename,
-        status: "success",
-        duration: 4000,
-        isClosable: true,
-        position: "top-right",
-      });
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : "Unknown error";
-      pendingItems.forEach((item) =>
-        onUpdate(item.url, { status: "error", error: msg })
-      );
+      // Only mark still-downloading items as error
+      pendingItems.forEach((item) => {
+        if (item.status === "downloading") {
+          onUpdate(item.url, { status: "error", error: msg });
+        }
+      });
       toast({
         title: "Download failed",
         description: msg,
@@ -266,11 +329,15 @@ export default function DownloadQueue({
       });
     } finally {
       setDownloading(false);
-      setDownloadSpeed("");
+      setOverallProgress(0);
+      setStatusMessage("");
+      setCurrentFileIndex(null);
+      setIsZipping(false);
+      abortRef.current = null;
     }
   };
 
-  // ── Download a single item ──────────────────────────────────────────────
+  // ── Download a single item (direct POST, no SSE needed) ────────────────
   const handleDownloadSingle = async (item: DownloadItem) => {
     onUpdate(item.url, { status: "downloading", progress: 0 });
 
@@ -282,7 +349,9 @@ export default function DownloadQueue({
       });
 
       if (!res.ok) {
-        const errBody = await res.json().catch(() => ({ error: `HTTP ${res.status}` }));
+        const errBody = await res
+          .json()
+          .catch(() => ({ error: `HTTP ${res.status}` }));
         throw new Error(errBody.error || `HTTP ${res.status}`);
       }
 
@@ -291,8 +360,7 @@ export default function DownloadQueue({
       triggerDownload(blob, filename);
 
       onUpdate(item.url, { status: "done", progress: 100 });
-      
-      // Notify parent that item is downloaded
+
       if (onDownloadComplete) {
         onDownloadComplete([item]);
       }
@@ -343,6 +411,9 @@ export default function DownloadQueue({
     );
   }
 
+  const totalFiles = pendingItems.length;
+  const completedFiles = pendingItems.filter((i) => i.status === "done").length;
+
   return (
     <VStack spacing={4} align="stretch">
       {/* ── Queue header ── */}
@@ -361,22 +432,46 @@ export default function DownloadQueue({
               {items.length} item{items.length !== 1 ? "s" : ""}
             </Text>
             {pendingItems.length > 0 && (
-              <Badge bg="rgba(85,85,85,0.13)" color="#888" borderRadius="full" px={2} fontSize="xs">
+              <Badge
+                bg="rgba(85,85,85,0.13)"
+                color="#888"
+                borderRadius="full"
+                px={2}
+                fontSize="xs"
+              >
                 {pendingItems.length} pending
               </Badge>
             )}
             {activeItems.length > 0 && (
-              <Badge bg="rgba(255,235,59,0.13)" color="#ffeb3b" borderRadius="full" px={2} fontSize="xs">
+              <Badge
+                bg="rgba(255,235,59,0.13)"
+                color="#ffeb3b"
+                borderRadius="full"
+                px={2}
+                fontSize="xs"
+              >
                 {activeItems.length} active
               </Badge>
             )}
             {doneItems.length > 0 && (
-              <Badge bg="rgba(74,222,128,0.13)" color="#4ade80" borderRadius="full" px={2} fontSize="xs">
+              <Badge
+                bg="rgba(74,222,128,0.13)"
+                color="#4ade80"
+                borderRadius="full"
+                px={2}
+                fontSize="xs"
+              >
                 {doneItems.length} done
               </Badge>
             )}
             {errorItems.length > 0 && (
-              <Badge bg="rgba(248,113,113,0.13)" color="#f87171" borderRadius="full" px={2} fontSize="xs">
+              <Badge
+                bg="rgba(248,113,113,0.13)"
+                color="#f87171"
+                borderRadius="full"
+                px={2}
+                fontSize="xs"
+              >
                 {errorItems.length} failed
               </Badge>
             )}
@@ -385,7 +480,7 @@ export default function DownloadQueue({
           {/* Actions */}
           <HStack spacing={3} flexWrap="wrap">
             {/* ZIP toggle — only show when there's 1 pending item */}
-            {pendingItems.length === 1 && (
+            {pendingItems.length === 1 && !downloading && (
               <HStack spacing={2}>
                 <Switch
                   id="zip-toggle"
@@ -413,16 +508,18 @@ export default function DownloadQueue({
               </HStack>
             )}
 
-            <Button
-              size="sm"
-              variant="ghostNeon"
-              leftIcon={<Icon as={FiTrash2} />}
-              onClick={onClear}
-              color="#555"
-              _hover={{ color: "#f87171" }}
-            >
-              Clear All
-            </Button>
+            {!downloading && (
+              <Button
+                size="sm"
+                variant="ghostNeon"
+                leftIcon={<Icon as={FiTrash2} />}
+                onClick={onClear}
+                color="#555"
+                _hover={{ color: "#f87171" }}
+              >
+                Clear All
+              </Button>
+            )}
 
             {pendingItems.length > 0 && (
               <Button
@@ -431,7 +528,9 @@ export default function DownloadQueue({
                 leftIcon={
                   <Icon
                     as={
-                      pendingItems.length > 1 || saveAsZip
+                      downloading
+                        ? FiLoader
+                        : pendingItems.length > 1 || saveAsZip
                         ? FiPackage
                         : FiDownload
                     }
@@ -439,7 +538,14 @@ export default function DownloadQueue({
                 }
                 onClick={handleDownloadAll}
                 isLoading={downloading}
-                loadingText="Downloading…"
+                loadingText={
+                  isZipping
+                    ? "Zipping…"
+                    : currentFileIndex !== null
+                    ? `File ${currentFileIndex + 1}/${totalFiles}`
+                    : "Starting…"
+                }
+                isDisabled={downloading}
               >
                 {pendingItems.length > 1
                   ? `Download All (${pendingItems.length}) as ZIP`
@@ -451,28 +557,104 @@ export default function DownloadQueue({
           </HStack>
         </Flex>
 
-        {/* Progress bar while downloading */}
-        {downloading && (
-          <Box mt={4}>
-            <Flex align="center" justify="space-between" mb={1.5}>
-              <Text fontSize="xs" color="#555">
-                Fetching files and building archive…
-              </Text>
-              {downloadSpeed && (
-                <Text fontSize="xs" color="#ffeb3b" fontWeight="600">
-                  {downloadSpeed}
+        {/* ── Progress panel while downloading ── */}
+        <AnimatePresence>
+          {downloading && (
+            <MotionBox
+              initial={{ opacity: 0, height: 0 }}
+              animate={{ opacity: 1, height: "auto" }}
+              exit={{ opacity: 0, height: 0 }}
+              overflow="hidden"
+              mt={4}
+            >
+              {/* Status message */}
+              <Flex align="center" justify="space-between" mb={2}>
+                <HStack spacing={2}>
+                  <Box
+                    w="6px"
+                    h="6px"
+                    borderRadius="full"
+                    bg="#ffeb3b"
+                    sx={{
+                      animation: "pulse 1.2s ease-in-out infinite",
+                      "@keyframes pulse": {
+                        "0%, 100%": { opacity: 1 },
+                        "50%": { opacity: 0.3 },
+                      },
+                    }}
+                  />
+                  <Text fontSize="xs" color="#888">
+                    {statusMessage || "Working…"}
+                  </Text>
+                </HStack>
+                {overallProgress > 0 && overallProgress < 100 && (
+                  <Text fontSize="xs" color="#ffeb3b" fontWeight="700">
+                    {overallProgress}%
+                  </Text>
+                )}
+              </Flex>
+
+              {/* Overall progress bar */}
+              <Progress
+                value={overallProgress}
+                size="sm"
+                colorScheme="yellow"
+                bg="#1a1a1a"
+                borderRadius="full"
+                isIndeterminate={overallProgress === 0}
+                sx={{
+                  "& > div": {
+                    transition: "width 0.4s ease",
+                  },
+                }}
+              />
+
+              {/* Per-file mini progress */}
+              {totalFiles > 1 && (
+                <Flex mt={2} gap={1} flexWrap="wrap">
+                  {pendingItems.map((item, idx) => (
+                    <Tooltip
+                      key={item.url}
+                      label={item.filename || `File ${idx + 1}`}
+                      hasArrow
+                      fontSize="xs"
+                    >
+                      <Box
+                        w="8px"
+                        h="8px"
+                        borderRadius="2px"
+                        bg={
+                          item.status === "done"
+                            ? "#4ade80"
+                            : item.status === "error"
+                            ? "#f87171"
+                            : item.status === "downloading"
+                            ? "#ffeb3b"
+                            : "#2a2a2a"
+                        }
+                        transition="background 0.3s"
+                        flexShrink={0}
+                        sx={
+                          item.status === "downloading"
+                            ? {
+                                animation: "pulse 0.8s ease-in-out infinite",
+                              }
+                            : {}
+                        }
+                      />
+                    </Tooltip>
+                  ))}
+                </Flex>
+              )}
+
+              {isZipping && (
+                <Text fontSize="xs" color="#a78bfa" mt={2}>
+                  ✦ Compressing files into ZIP…
                 </Text>
               )}
-            </Flex>
-            <Progress
-              size="xs"
-              isIndeterminate={!downloadSpeed}
-              colorScheme="yellow"
-              bg="#1a1a1a"
-              borderRadius="full"
-            />
-          </Box>
-        )}
+            </MotionBox>
+          )}
+        </AnimatePresence>
       </MotionBox>
 
       {/* ── Items list ── */}
@@ -491,10 +673,20 @@ export default function DownloadQueue({
                 exit={{ opacity: 0, x: 16 }}
                 transition={{ delay: Math.min(idx * 0.02, 0.3) }}
                 bg="#0d0d0d"
-                border="1px solid #1a1a1a"
+                border="1px solid"
+                borderColor={
+                  item.status === "downloading"
+                    ? "rgba(255,235,59,0.15)"
+                    : item.status === "done"
+                    ? "rgba(74,222,128,0.1)"
+                    : item.status === "error"
+                    ? "rgba(248,113,113,0.1)"
+                    : "#1a1a1a"
+                }
                 borderRadius="12px"
                 p={3}
                 _hover={{ borderColor: "#2a2a2a" }}
+                transition="border-color 0.2s"
               >
                 <Flex align="center" gap={3}>
                   {/* Thumbnail */}
@@ -565,10 +757,15 @@ export default function DownloadQueue({
                           colorScheme="yellow"
                           bg="#1a1a1a"
                           borderRadius="full"
-                          isIndeterminate={!item.progress || item.progress === 0}
+                          isIndeterminate={
+                            !item.progress || item.progress === 0
+                          }
+                          sx={{
+                            "& > div": { transition: "width 0.3s ease" },
+                          }}
                         />
-                        {item.progress && item.progress > 0 && (
-                          <Text fontSize="10px" color="#555" mt={0.5}>
+                        {item.progress !== undefined && item.progress > 0 && (
+                          <Text fontSize="10px" color="#666" mt={0.5}>
                             {item.progress}%
                           </Text>
                         )}
@@ -576,7 +773,12 @@ export default function DownloadQueue({
                     )}
 
                     {item.status === "error" && item.error && (
-                      <Text fontSize="xs" color="#f87171" mt={0.5} noOfLines={1}>
+                      <Text
+                        fontSize="xs"
+                        color="#f87171"
+                        mt={0.5}
+                        noOfLines={1}
+                      >
                         {item.error}
                       </Text>
                     )}
@@ -590,10 +792,21 @@ export default function DownloadQueue({
                       borderRadius="full"
                       bg={statusColor[item.status]}
                       flexShrink={0}
+                      sx={
+                        item.status === "downloading"
+                          ? {
+                              animation: "pulse 1s ease-in-out infinite",
+                              "@keyframes pulse": {
+                                "0%, 100%": { opacity: 1 },
+                                "50%": { opacity: 0.2 },
+                              },
+                            }
+                          : {}
+                      }
                     />
 
-                    {/* Download single */}
-                    {item.status === "pending" && (
+                    {/* Download single (only when not in batch download) */}
+                    {item.status === "pending" && !downloading && (
                       <Tooltip label="Download this file" hasArrow>
                         <Box
                           as="button"
@@ -649,28 +862,30 @@ export default function DownloadQueue({
                       </Tooltip>
                     )}
 
-                    {/* Remove */}
-                    <Tooltip label="Remove" hasArrow>
-                      <Box
-                        as="button"
-                        w="28px"
-                        h="28px"
-                        bg="#111"
-                        border="1px solid #1a1a1a"
-                        borderRadius="7px"
-                        display="flex"
-                        alignItems="center"
-                        justifyContent="center"
-                        onClick={() => onRemove(item.url)}
-                        _hover={{
-                          bg: "#1a0a0a",
-                          borderColor: "rgba(248,113,113,0.2)",
-                        }}
-                        transition="all 0.15s"
-                      >
-                        <Icon as={FiX} color="#555" boxSize={3.5} />
-                      </Box>
-                    </Tooltip>
+                    {/* Remove (disabled during download) */}
+                    {!downloading && (
+                      <Tooltip label="Remove" hasArrow>
+                        <Box
+                          as="button"
+                          w="28px"
+                          h="28px"
+                          bg="#111"
+                          border="1px solid #1a1a1a"
+                          borderRadius="7px"
+                          display="flex"
+                          alignItems="center"
+                          justifyContent="center"
+                          onClick={() => onRemove(item.url)}
+                          _hover={{
+                            bg: "#1a0a0a",
+                            borderColor: "rgba(248,113,113,0.2)",
+                          }}
+                          transition="all 0.15s"
+                        >
+                          <Icon as={FiX} color="#555" boxSize={3.5} />
+                        </Box>
+                      </Tooltip>
+                    )}
                   </HStack>
                 </Flex>
               </MotionBox>

@@ -5,7 +5,7 @@ services:
   - name: web
     source_dir: /
     github:
-      repo: cloudblurr/harveey-vyddy
+      repo: cloudblurr/Vyddy.Harveey
       branch: main
       deploy_on_push: true
     build_command: npm run build
@@ -19,6 +19,7 @@ services:
     envs:
       - key: NODE_ENV
         value: production
+        scope: RUN_AND_BUILD_TIME
       - key: AGENT_ENDPOINT
         scope: RUN_AND_BUILD_TIME
         type: SECRET
@@ -32,6 +33,12 @@ services:
         scope: RUN_AND_BUILD_TIME
         type: SECRET
       - key: PASSWORD
+        scope: RUN_AND_BUILD_TIME
+        type: SECRET
+      - key: GITHUB_ACCESS_TOKEN
+        scope: RUN_AND_BUILD_TIME
+        type: SECRET
+      - key: DIGITAL_OCEAN_API
         scope: RUN_AND_BUILD_TIME
         type: SECRET
 

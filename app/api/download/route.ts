@@ -35,7 +35,6 @@ function generateZipName(): string {
   const pick = <T>(arr: T[]): T => arr[Math.floor(Math.random() * arr.length)];
   const adj1 = pick(ADJECTIVES);
   let adj2 = pick(ADJECTIVES);
-  // Avoid duplicate adjectives
   while (adj2 === adj1) adj2 = pick(ADJECTIVES);
   const animal = pick(ANIMALS);
   return `${adj1}${adj2}${animal}.zip`;
@@ -44,8 +43,8 @@ function generateZipName(): string {
 // Save completed downloads to history
 async function saveToHistory(items: DownloadItem[]) {
   const historyPath = path.join(process.cwd(), ".harveey-history.json");
-  
-  let history: any[] = [];
+
+  let history: unknown[] = [];
   try {
     if (fs.existsSync(historyPath)) {
       const data = fs.readFileSync(historyPath, "utf-8");
@@ -55,7 +54,7 @@ async function saveToHistory(items: DownloadItem[]) {
     history = [];
   }
 
-  const newItems = items.map(item => ({
+  const newItems = items.map((item) => ({
     id: item.id,
     url: item.url,
     filename: item.filename,
@@ -80,12 +79,12 @@ export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 export const maxDuration = 300; // 5 minutes for large batches
 
-// Parallel fetch with concurrency limit for speed
+// Fetch a single media file with timeout
 async function fetchMediaBuffer(
   url: string
 ): Promise<{ buffer: Buffer; contentType: string; filename: string }> {
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 45000); // 45s timeout per file
+  const timeout = setTimeout(() => controller.abort(), 45000);
 
   try {
     const res = await fetch(url, {
@@ -109,17 +108,18 @@ async function fetchMediaBuffer(
 
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
 
-    const contentType = res.headers.get("content-type") || "application/octet-stream";
+    const contentType =
+      res.headers.get("content-type") || "application/octet-stream";
     const arrayBuffer = await res.arrayBuffer();
     const buffer = Buffer.from(arrayBuffer);
 
-    // Derive filename
     const cd = res.headers.get("content-disposition") || "";
     const cdMatch = cd.match(/filename[^;=\n]*=((['"]).*?\2|[^;\n]*)/);
     let filename = cdMatch ? cdMatch[1].replace(/['"]/g, "").trim() : "";
     if (!filename) {
       try {
-        filename = path.basename(new URL(url).pathname.split("?")[0]) || "media";
+        filename =
+          path.basename(new URL(url).pathname.split("?")[0]) || "media";
       } catch {
         filename = "media";
       }
@@ -132,126 +132,193 @@ async function fetchMediaBuffer(
   }
 }
 
-// Build ZIP with streaming: fetch one file, add to archive, fetch next
-// This starts the ZIP download immediately and streams files as they arrive
-async function buildZipStreaming(items: DownloadItem[]): Promise<Buffer> {
-  const archiver = (await import("archiver")).default;
+// ── SSE progress endpoint: GET /api/download?items=...&forceZip=... ─────────
+// Streams progress events then the final file as base64 in the last event.
+// This lets the frontend show per-file progress while downloading sequentially.
+export async function GET(req: NextRequest) {
+  const { searchParams } = new URL(req.url);
+  const rawItems = searchParams.get("items");
+  const forceZip = searchParams.get("forceZip") === "true";
 
-  return new Promise((resolve, reject) => {
-    const arc = archiver("zip", {
-      zlib: { level: 6 }, // Balanced compression
-      store: false, // Don't store uncompressed (faster)
-    });
-
-    const chunks: Buffer[] = [];
-
-    arc.on("data", (chunk: Buffer) => chunks.push(chunk));
-    arc.on("end", () => resolve(Buffer.concat(chunks)));
-    arc.on("error", reject);
-
-    // Process files with controlled concurrency (3 at a time for speed)
-    const CONCURRENCY = 3;
-    let activeCount = 0;
-    let currentIndex = 0;
-    let hasError = false;
-
-    const processNext = () => {
-      if (hasError || currentIndex >= items.length) {
-        // All queued, check if we're done
-        if (activeCount === 0 && currentIndex >= items.length) {
-          arc.finalize();
-        }
-        return;
-      }
-
-      while (activeCount < CONCURRENCY && currentIndex < items.length) {
-        const index = currentIndex++;
-        const item = items[index];
-
-        activeCount++;
-
-        fetchMediaBuffer(item.url)
-          .then(({ buffer, filename }) => {
-            const safeName =
-              item.filename ||
-              filename ||
-              `media_${index + 1}${path.extname(item.url.split("?")[0]) || ""}`;
-
-            // Append to archive immediately
-            arc.append(buffer, { name: safeName });
-          })
-          .catch((err) => {
-            console.error(`Failed to fetch ${item.url}:`, err);
-            // Add error file instead of failing entire download
-            arc.append(
-              Buffer.from(
-                `Failed to download: ${item.url}\nError: ${err.message || "Unknown error"}\n`
-              ),
-              { name: `error_${index + 1}.txt` }
-            );
-          })
-          .finally(() => {
-            activeCount--;
-            processNext(); // Process next file
-          });
-      }
-    };
-
-    // Start processing
-    processNext();
-  });
-}
-
-// Alternative: Parallel fetch all at once (fastest for small batches)
-async function buildZipParallel(items: DownloadItem[]): Promise<Buffer> {
-  const archiver = (await import("archiver")).default;
-
-  // Fetch all files in parallel with concurrency limit
-  const BATCH_SIZE = 5;
-  const results: Array<{ buffer: Buffer; name: string }> = [];
-
-  for (let i = 0; i < items.length; i += BATCH_SIZE) {
-    const batch = items.slice(i, i + BATCH_SIZE);
-    const batchResults = await Promise.allSettled(
-      batch.map((item, batchIdx) =>
-        fetchMediaBuffer(item.url)
-          .then(({ buffer, filename }) => ({
-            buffer,
-            name:
-              item.filename ||
-              filename ||
-              `media_${i + batchIdx + 1}${path.extname(item.url.split("?")[0]) || ""}`,
-          }))
-          .catch((err) => ({
-            buffer: Buffer.from(
-              `Failed to download: ${item.url}\nError: ${err.message || "Unknown"}\n`
-            ),
-            name: `error_${i + batchIdx + 1}.txt`,
-          }))
-      )
-    );
-
-    batchResults.forEach((result) => {
-      if (result.status === "fulfilled") {
-        results.push(result.value);
-      }
-    });
+  if (!rawItems) {
+    return NextResponse.json({ error: "No items provided." }, { status: 400 });
   }
 
-  // Build ZIP from collected buffers
-  return new Promise((resolve, reject) => {
-    const arc = archiver("zip", { zlib: { level: 6 } });
-    const chunks: Buffer[] = [];
+  let items: DownloadItem[];
+  try {
+    items = JSON.parse(decodeURIComponent(rawItems));
+  } catch {
+    return NextResponse.json({ error: "Invalid items JSON." }, { status: 400 });
+  }
 
-    arc.on("data", (chunk: Buffer) => chunks.push(chunk));
-    arc.on("end", () => resolve(Buffer.concat(chunks)));
-    arc.on("error", reject);
+  if (!items.length) {
+    return NextResponse.json({ error: "No items provided." }, { status: 400 });
+  }
 
-    results.forEach(({ buffer, name }) => arc.append(buffer, { name }));
-    arc.finalize();
+  const encoder = new TextEncoder();
+
+  const stream = new ReadableStream({
+    async start(controller) {
+      const send = (data: object) => {
+        controller.enqueue(
+          encoder.encode(`data: ${JSON.stringify(data)}\n\n`)
+        );
+      };
+
+      try {
+        const useZip = forceZip || items.length > 1;
+
+        if (!useZip) {
+          // ── Single file ──────────────────────────────────────────────────
+          const item = items[0];
+          send({ type: "start", total: 1, current: 0 });
+          send({
+            type: "file_start",
+            index: 0,
+            filename: item.filename || "media",
+            total: 1,
+          });
+
+          try {
+            const { buffer, contentType, filename } = await fetchMediaBuffer(
+              item.url
+            );
+            const safeName = item.filename || filename;
+
+            send({
+              type: "file_done",
+              index: 0,
+              filename: safeName,
+              total: 1,
+            });
+
+            send({
+              type: "complete",
+              filename: safeName,
+              contentType,
+              data: buffer.toString("base64"),
+              isZip: false,
+            });
+
+            saveToHistory([item]);
+          } catch (err) {
+            send({
+              type: "file_error",
+              index: 0,
+              filename: item.filename || "media",
+              error: err instanceof Error ? err.message : "Unknown error",
+            });
+            send({ type: "error", message: "Failed to download file." });
+          }
+        } else {
+          // ── Multiple files → ZIP, one at a time with progress ────────────
+          const archiver = (await import("archiver")).default;
+          const arc = archiver("zip", { zlib: { level: 6 } });
+          const chunks: Buffer[] = [];
+
+          arc.on("data", (chunk: Buffer) => chunks.push(chunk));
+
+          const zipReady = new Promise<void>((resolve, reject) => {
+            arc.on("end", resolve);
+            arc.on("error", reject);
+          });
+
+          send({ type: "start", total: items.length, current: 0 });
+
+          // Download files ONE AT A TIME so user sees clear sequential progress
+          for (let i = 0; i < items.length; i++) {
+            const item = items[i];
+            send({
+              type: "file_start",
+              index: i,
+              filename: item.filename || `file_${i + 1}`,
+              total: items.length,
+              current: i + 1,
+            });
+
+            try {
+              const { buffer, filename } = await fetchMediaBuffer(item.url);
+              const safeName =
+                item.filename ||
+                filename ||
+                `media_${i + 1}${path.extname(item.url.split("?")[0]) || ""}`;
+
+              arc.append(buffer, { name: safeName });
+
+              send({
+                type: "file_done",
+                index: i,
+                filename: safeName,
+                total: items.length,
+                current: i + 1,
+                progress: Math.round(((i + 1) / items.length) * 100),
+              });
+            } catch (err) {
+              const errMsg =
+                err instanceof Error ? err.message : "Unknown error";
+              console.error(`Failed to fetch ${item.url}:`, err);
+
+              // Add error placeholder in ZIP
+              arc.append(
+                Buffer.from(
+                  `Failed to download: ${item.url}\nError: ${errMsg}\n`
+                ),
+                { name: `error_${i + 1}.txt` }
+              );
+
+              send({
+                type: "file_error",
+                index: i,
+                filename: item.filename || `file_${i + 1}`,
+                error: errMsg,
+                total: items.length,
+                current: i + 1,
+                progress: Math.round(((i + 1) / items.length) * 100),
+              });
+            }
+          }
+
+          // Finalize ZIP
+          send({ type: "zipping", message: "Building ZIP archive…" });
+          arc.finalize();
+          await zipReady;
+
+          const zipBuffer = Buffer.concat(chunks);
+          const zipName = generateZipName();
+
+          send({
+            type: "complete",
+            filename: zipName,
+            contentType: "application/zip",
+            data: zipBuffer.toString("base64"),
+            isZip: true,
+          });
+
+          saveToHistory(items);
+        }
+      } catch (err) {
+        console.error("SSE download error:", err);
+        send({
+          type: "error",
+          message: err instanceof Error ? err.message : "Internal error",
+        });
+      } finally {
+        controller.close();
+      }
+    },
+  });
+
+  return new Response(stream, {
+    headers: {
+      "Content-Type": "text/event-stream",
+      "Cache-Control": "no-cache, no-transform",
+      Connection: "keep-alive",
+      "X-Accel-Buffering": "no", // Disable nginx buffering
+    },
   });
 }
 
+// ── POST: kept for single-file direct download (no SSE needed) ──────────────
 export async function POST(req: NextRequest) {
   try {
     const body = await req.json();
@@ -262,14 +329,15 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ error: "No items provided." }, { status: 400 });
     }
 
-    // ── Single file, no zip requested ──────────────────────────────────────
+    // ── Single file, no zip ─────────────────────────────────────────────────
     if (items.length === 1 && !forceZip) {
       const item = items[0];
       try {
-        const { buffer, contentType, filename } = await fetchMediaBuffer(item.url);
+        const { buffer, contentType, filename } = await fetchMediaBuffer(
+          item.url
+        );
         const safeName = item.filename || filename;
 
-        // Save to history
         saveToHistory([item]);
 
         return new NextResponse(new Uint8Array(buffer), {
@@ -290,15 +358,44 @@ export async function POST(req: NextRequest) {
       }
     }
 
-    // ── Multiple files (or forceZip) → ZIP with optimized strategy ─────────
+    // ── Multiple files → ZIP (sequential, no progress feedback) ────────────
     try {
-      // Use parallel batching for speed (5 at a time)
-      // This is faster than streaming for most use cases
-      const zipBuffer = await buildZipParallel(items);
+      const archiver = (await import("archiver")).default;
+      const arc = archiver("zip", { zlib: { level: 6 } });
+      const chunks: Buffer[] = [];
 
+      arc.on("data", (chunk: Buffer) => chunks.push(chunk));
+
+      const zipReady = new Promise<void>((resolve, reject) => {
+        arc.on("end", resolve);
+        arc.on("error", reject);
+      });
+
+      for (let i = 0; i < items.length; i++) {
+        const item = items[i];
+        try {
+          const { buffer, filename } = await fetchMediaBuffer(item.url);
+          const safeName =
+            item.filename ||
+            filename ||
+            `media_${i + 1}${path.extname(item.url.split("?")[0]) || ""}`;
+          arc.append(buffer, { name: safeName });
+        } catch (err) {
+          arc.append(
+            Buffer.from(
+              `Failed to download: ${item.url}\nError: ${err instanceof Error ? err.message : "Unknown"}\n`
+            ),
+            { name: `error_${i + 1}.txt` }
+          );
+        }
+      }
+
+      arc.finalize();
+      await zipReady;
+
+      const zipBuffer = Buffer.concat(chunks);
       const zipName = generateZipName();
 
-      // Save to history
       saveToHistory(items);
 
       return new NextResponse(new Uint8Array(zipBuffer), {
@@ -312,10 +409,16 @@ export async function POST(req: NextRequest) {
       });
     } catch (err) {
       console.error("ZIP build error:", err);
-      return NextResponse.json({ error: "Failed to build ZIP." }, { status: 502 });
+      return NextResponse.json(
+        { error: "Failed to build ZIP." },
+        { status: 502 }
+      );
     }
   } catch (err) {
     console.error("Download route error:", err);
-    return NextResponse.json({ error: "Internal server error." }, { status: 500 });
+    return NextResponse.json(
+      { error: "Internal server error." },
+      { status: 500 }
+    );
   }
 }
