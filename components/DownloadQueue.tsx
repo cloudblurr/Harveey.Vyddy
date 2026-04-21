@@ -175,10 +175,17 @@ export default function DownloadQueue({
     const useZip = saveAsZip || pendingItems.length > 1;
 
     try {
-      const itemsParam = encodeURIComponent(JSON.stringify(pendingItems));
-      const url = `/api/download?items=${itemsParam}&forceZip=${useZip}`;
+      const url = `/api/download`;
 
-      const res = await fetch(url, { method: "GET" });
+      const res = await fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          items: pendingItems,
+          forceZip: useZip,
+          useSSE: true,
+        }),
+      });
 
       if (!res.ok || !res.body) {
         throw new Error(`Server error: HTTP ${res.status}`);

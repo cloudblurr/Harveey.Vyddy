@@ -132,28 +132,11 @@ async function fetchMediaBuffer(
   }
 }
 
-// ── SSE progress endpoint: GET /api/download?items=...&forceZip=... ─────────
+// ── SSE progress endpoint: POST /api/download (with SSE response) ───────────
 // Streams progress events then the final file as base64 in the last event.
 // This lets the frontend show per-file progress while downloading sequentially.
-export async function GET(req: NextRequest) {
-  const { searchParams } = new URL(req.url);
-  const rawItems = searchParams.get("items");
-  const forceZip = searchParams.get("forceZip") === "true";
-
-  if (!rawItems) {
-    return NextResponse.json({ error: "No items provided." }, { status: 400 });
-  }
-
-  let items: DownloadItem[];
-  try {
-    items = JSON.parse(decodeURIComponent(rawItems));
-  } catch {
-    return NextResponse.json({ error: "Invalid items JSON." }, { status: 400 });
-  }
-
-  if (!items.length) {
-    return NextResponse.json({ error: "No items provided." }, { status: 400 });
-  }
+// Uses POST to avoid URL length limits with many items.
+async function handleSSEDownload(items: DownloadItem[], forceZip: boolean) {
 
   const encoder = new TextEncoder();
 
@@ -318,15 +301,21 @@ export async function GET(req: NextRequest) {
   });
 }
 
-// ── POST: kept for single-file direct download (no SSE needed) ──────────────
+// ── POST: Main endpoint for downloads with SSE progress ─────────────────────
 export async function POST(req: NextRequest) {
   try {
     const body = await req.json();
     const items: DownloadItem[] = body.items ?? [];
     const forceZip: boolean = body.forceZip ?? false;
+    const useSSE: boolean = body.useSSE ?? true; // Default to SSE for progress
 
     if (!items.length) {
       return NextResponse.json({ error: "No items provided." }, { status: 400 });
+    }
+
+    // Use SSE for progress updates (default behavior)
+    if (useSSE) {
+      return handleSSEDownload(items, forceZip);
     }
 
     // ── Single file, no zip ─────────────────────────────────────────────────
