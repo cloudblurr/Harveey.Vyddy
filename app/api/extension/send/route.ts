@@ -3,6 +3,7 @@ import { DownloadItem } from "@/types";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
+export const maxDuration = 10; // Fast endpoint — fail quickly rather than hanging
 
 // CORS headers for extension requests from social media sites
 const corsHeaders = {

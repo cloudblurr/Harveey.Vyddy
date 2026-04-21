@@ -295,8 +295,12 @@ async function handleSSEDownload(items: DownloadItem[], forceZip: boolean) {
     headers: {
       "Content-Type": "text/event-stream",
       "Cache-Control": "no-cache, no-transform",
-      Connection: "keep-alive",
-      "X-Accel-Buffering": "no", // Disable nginx buffering
+      "Connection": "keep-alive",
+      "X-Accel-Buffering": "no",       // Disable nginx buffering
+      "X-Content-Type-Options": "nosniff",
+      // Force HTTP/1.1 — SSE is incompatible with HTTP/2 multiplexing on some proxies
+      // and breaks entirely over QUIC/HTTP3
+      "Alt-Svc": "clear",
     },
   });
 }

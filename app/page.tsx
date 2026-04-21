@@ -32,20 +32,26 @@ export default function Home() {
 
   // Poll for extension queue items
   const pollExtensionQueue = useCallback(async () => {
+    // Abort if the request takes longer than 8 seconds
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 8000);
+
     try {
-      const res = await fetch("/api/extension/send", { 
+      const res = await fetch("/api/extension/send", {
         method: "GET",
-        headers: { "Content-Type": "application/json" }
+        signal: controller.signal,
       });
+      clearTimeout(timeout);
+
+      if (!res.ok) return; // silently skip non-200 responses
+
       const data = await res.json();
-      
+
       if (data.success && data.items && data.items.length > 0) {
-        // Add new items to download queue
         setDownloadQueue((prev) => {
           const existingUrls = new Set(prev.map((i) => i.url));
           const newItems = data.items.filter((i: DownloadItem) => !existingUrls.has(i.url));
           if (newItems.length > 0) {
-            // Show notification
             toast({
               title: `${newItems.length} item${newItems.length > 1 ? "s" : ""} from extension`,
               description: "Added to download queue",
@@ -53,25 +59,27 @@ export default function Home() {
               duration: 3000,
               position: "top-right",
             });
-            // Switch to queue tab if not already there
             setActiveTab("queue");
           }
           return [...prev, ...newItems];
         });
-        
         setExtensionQueueCount(data.items.length);
       } else {
         setExtensionQueueCount(0);
       }
     } catch (error) {
-      console.error("Failed to poll extension queue:", error);
+      clearTimeout(timeout);
+      // Silently ignore aborts and network errors — polling will retry
+      if (error instanceof Error && error.name !== "AbortError") {
+        console.error("Failed to poll extension queue:", error);
+      }
     }
   }, [toast]);
 
-  // Poll every 3 seconds for new extension items
+  // Poll every 10 seconds — fast enough to feel responsive, light enough for serverless
   useEffect(() => {
     pollExtensionQueue();
-    const interval = setInterval(pollExtensionQueue, 3000);
+    const interval = setInterval(pollExtensionQueue, 10000);
     return () => clearInterval(interval);
   }, [pollExtensionQueue]);
 
